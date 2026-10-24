@@ -1,10 +1,20 @@
 import json
+from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
 from pydantic import ValidationError
 
-from lego_events import Event, UnknownEventError, WatchDeleted, WatchState, WatchUpserted, parse
+from lego_events import (
+    Event,
+    ListingMatched,
+    ListingSnapshot,
+    UnknownEventError,
+    WatchDeleted,
+    WatchState,
+    WatchUpserted,
+    parse,
+)
 
 
 def castle_watch(**overrides):
@@ -52,3 +62,17 @@ def test_routing_keys_must_be_unique():
 
         class Duplicate(Event):
             routing_key = "watch.deleted"
+
+
+def test_listing_event_round_trip_and_total_price():
+    listing = ListingSnapshot(
+        source="fake", external_id="a1", title="LEGO 6086", url="https://example.test",
+        price=Decimal("110.00"), shipping=Decimal("10.00"), first_seen=datetime.now(UTC),
+    )
+    sent = ListingMatched(watch_id=1, set_num="6086-1", listing=listing)
+
+    received = parse("listing.matched", sent.model_dump_json())
+
+    assert received == sent
+    assert received.listing.total_price == Decimal("120.00")
+    assert listing.model_copy(update={"shipping": None}).total_price == Decimal("110.00")

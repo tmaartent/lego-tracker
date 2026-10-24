@@ -12,7 +12,7 @@ the code today.
 1. [Goals and non-goals](#1-goals-and-non-goals)
 2. [Services at a glance](#2-services-at-a-glance)
 3. [core](#3-core)
-4. [watcher (planned)](#4-watcher-planned)
+4. [watcher](#4-watcher)
 5. [notifier (planned)](#5-notifier-planned)
 6. [Messaging](#6-messaging)
 7. [Reliability](#7-reliability)
@@ -50,7 +50,7 @@ asynchronous messaging and the failure handling that comes with it.
 ```
                  ┌──────────────────┐  watch.upserted / watch.deleted   ┌─────────────┐
   me ──admin──►  │ core (Django)    │ ──────────────┐                    │ watcher     │ ◄── eBay
-                 │ catalog          │               ▼                    │ (planned)   │
+                 │ catalog          │               ▼                    │             │
                  │ collection       │       ┌───────────────┐ ────────►  │             │
                  │ watches, outbox  │ ◄──── │ RabbitMQ      │ ◄────────  └─────────────┘
                  └────────┬─────────┘       │ "lego.events" │  listing.matched
@@ -65,7 +65,7 @@ asynchronous messaging and the failure handling that comes with it.
 | Service | Owns | Publishes | Consumes | Stack |
 |---|---|---|---|---|
 | **core** | Catalog, owned sets, missing parts, watches, offers | `watch.*` | `listing.*` (planned) | Django, django-ninja, PostgreSQL |
-| **watcher** (planned) | Listings seen on marketplaces, its copy of the watches | `listing.*` | `watch.*` | FastAPI, FastStream, SQLAlchemy, PostgreSQL |
+| **watcher** | Listings seen on marketplaces, its copy of the watches | `listing.*` | `watch.*` | FastAPI, FastStream, SQLAlchemy, PostgreSQL |
 | **notifier** (planned) | Which notifications were sent | none | `listing.matched` | FastAPI, FastStream, PostgreSQL |
 | **libs/events** | The event contracts | n/a | n/a | pydantic |
 
@@ -161,32 +161,106 @@ core runs as two containers from the same image:
 The relay is separate so the web app is unaffected when RabbitMQ is slow or down, and
 so it can be restarted on its own.
 
-## 4. watcher (planned)
+## 4. watcher
 
-Finds marketplace listings that match a watch.
+Finds marketplace listings that match a watch. A FastAPI app; the RabbitMQ consumer,
+the poller and the outbox relay run in the same process as background tasks.
 
-**Responsibilities**
+### 4.1 Modules
 
-- On startup, load all watches from `GET /api/watches/`, then follow `watch.*` events.
-- Poll each source on a schedule. Sources are pluggable adapters behind one interface;
-  the first ones are a **fake source** (for tests and demos) and **eBay's Browse API**.
-- Normalize listings to one shape: source, external id, title, price, shipping cost,
-  location, URL, first seen and last seen.
-- Recognize listings it has already seen, by source and external id.
-- Match listings against watches:
-  - set number recognized in the title (sellers write "lego kasteel 6086 compleet?");
-    uncertain matches are flagged for checking by hand rather than dropped;
-  - total price (price + shipping) at or below the watch's maximum;
-  - distance from home within the maximum. This is approximate, based on Belgian postcodes.
-- Publish `listing.matched` for a new match and `listing.price_dropped` when a known
-  matching listing gets cheaper. Both go through the watcher's own outbox.
+| Module | Job |
+|---|---|
+| `app.py` | Wires everything together; the FastAPI lifespan starts the broker, then the background tasks. |
+| `consumer.py` | FastStream subscriber on `watcher.watches`. |
+| `watches.py` | Applies watch events and core's snapshot to the local copy, by revision. |
+| `sources/` | Source adapters behind one `Source` interface. Today: `FakeSource`. |
+| `poller.py` | Fetches from a source, stores listings, matches them, announces matches. |
+| `matching.py` | Set number in the title, incomplete-set words, price and distance limits. |
+| `geo.py` | Approximate distance between Belgian postcodes. |
+| `outbox.py` | Same outbox pattern as core, on SQLAlchemy. |
+| `api.py` | HTTP endpoints. |
 
-**HTTP endpoints** (FastAPI): health, `GET /listings`, and
-`POST /sources/{id}/poll` to trigger a poll by hand.
+### 4.2 Data model
 
-**Open questions for eBay**, to check against the documentation before building:
-whether search results include shipping cost to Belgium, and how precise the item
-location is.
+Its own PostgreSQL database `watcher`, migrated with Alembic.
+
+| Table | Holds |
+|---|---|
+| `watches` | Copy of core's watches, with their revision. Deleted watches stay as tombstones, so a late event can't bring them back. |
+| `listings` | Every listing seen, unique per source and the source's own id. Price, shipping, postcode, first and last seen. |
+| `matches` | Which listing matches which watch, and the lowest total price announced so far. |
+| `processed_events` | Ids of events already handled (see [7.4](#74-idempotent-consumers)). |
+| `outbox` | Events waiting to be published. |
+
+### 4.3 Startup
+
+1. Start the broker. This declares and binds `watcher.watches`, so watch changes start
+   collecting in the queue.
+2. Load the snapshot from core's `GET /api/watches/`. If core isn't up yet, retry every
+   5 seconds; the rest of the watcher already runs.
+3. Start the background tasks: poll every source on a schedule
+   (`WATCHER_POLL_INTERVAL_SECONDS`), and relay the outbox every second.
+
+### 4.4 Sources
+
+A source gets the live watches and returns what it found. It decides itself how: a
+search API runs a query per watch, an email inbox returns whatever arrived.
+
+| Source | How | Status |
+|---|---|---|
+| `fake` | In memory. Listings are added with `POST /sources/fake/listings`, for tests and demos. | built |
+| Email alerts | Reads saved-search alert emails over IMAP. 2dehands and Marktplaats first; Catawiki, Kleinanzeigen, Facebook Marketplace and Vinted only if their alerts turn out to be usable by email. | planned |
+| eBay | The official Browse API. Still to check: whether results include shipping to Belgium, and how precise the item location is. | planned |
+| BrickLink / Brick Owl | Official APIs, if access is granted (BrickLink requires a seller account). Also a source of typical prices for a deal score. | planned |
+
+Sites without an API are only used through their own email alerts. No scraping.
+
+### 4.5 A poll, step by step
+
+1. Read the live watches, then call the source. This happens **outside** a database
+   transaction, so a slow marketplace doesn't hold locks.
+2. In one transaction, for each listing found:
+   - insert it, or update its price, title and `last_seen` if it's known;
+   - check it against every live watch;
+   - a match not seen before: store it and enqueue `listing.matched`;
+   - a known match whose total price is below the lowest announced: enqueue
+     `listing.price_dropped` and remember the new price. A price that goes up and back
+     down again is not announced twice.
+3. Commit. The relay publishes the events afterwards.
+
+Polls of the same source never run at the same time: a manual poll waits for a
+scheduled one.
+
+### 4.6 Matching
+
+A listing matches a watch when all of these hold:
+
+- the watch is active and not deleted;
+- the title names the set: `6086` or `6086-1` for set 6086-1, but not `60861`, `16086`,
+  `6086-2`, `€6086` or `6086 euro`;
+- if the watch doesn't accept incomplete sets, the title has no words like *incompleet*,
+  *niet volledig*, *ontbreekt*, *incomplete*, *missing*, *incomplet* or *unvollständig*;
+- the total price (price + shipping) is within the maximum;
+- the distance from home is within the maximum.
+
+Unknown shipping or distance does **not** rule a listing out; the event carries it as
+unknown (`shipping: null`, `distance_km: null`). The rules err on the side of reporting
+a listing: a false alarm costs a glance, a missed deal costs the deal.
+
+Distance is a straight line between postcode centres, so it's good to a few kilometres.
+It only works for Belgian postcodes (GeoNames data, CC BY 4.0); everywhere else it's
+unknown.
+
+### 4.7 HTTP endpoints
+
+OpenAPI docs at `/docs`.
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /health` | Liveness, used by the docker-compose health check. |
+| `GET /listings?matched=true` | Listings seen, newest first, with the watches they match. |
+| `POST /sources/{name}/poll` | Poll one source now instead of waiting for the schedule. |
+| `POST /sources/fake/listings` | Put a listing on the fake marketplace. Reusing an `external_id` changes that listing, e.g. to demo a price drop. |
 
 ## 5. notifier (planned)
 
@@ -208,15 +282,13 @@ Sends a Telegram message for every `listing.matched`.
   needs. RabbitMQ copies a message to every bound queue, so adding a consumer never
   affects the others.
 
-Planned queues:
+| Queue | Bound to | Owner | Status |
+|---|---|---|---|
+| `watcher.watches` | `watch.*` | watcher | built |
+| `core.listings` | `listing.*` | core | planned |
+| `notifier.matches` | `listing.matched` | notifier | planned |
 
-| Queue | Bound to | Owner |
-|---|---|---|
-| `watcher.watches` | `watch.*` | watcher |
-| `core.listings` | `listing.*` | core |
-| `notifier.matches` | `listing.matched` | notifier |
-
-Plus a dead-letter exchange and a queue per consumer for messages that keep failing.
+Planned: a dead-letter exchange and a queue per consumer for messages that keep failing.
 
 Messages are persistent (`delivery_mode=2`). Properties: `content_type` is
 `application/json`, `message_id` is the event id, `type` is the routing key.
@@ -240,8 +312,8 @@ rejects unknown routing keys and invalid payloads.
 |---|---|---|---|
 | `watch.upserted` | core | `watch: WatchState` | built |
 | `watch.deleted` | core | `watch_id`, `revision` | built |
-| `listing.matched` | watcher | listing and the watch it matches | planned |
-| `listing.price_dropped` | watcher | listing, old and new total price | planned |
+| `listing.matched` | watcher | `watch_id`, `set_num`, `listing: ListingSnapshot` | built |
+| `listing.price_dropped` | watcher | as above, plus `previous_total_price` | built |
 
 `WatchState`: `watch_id`, `revision`, `set_num`, `set_name`, `max_total_price`,
 `max_distance_km`, `accept_incomplete`, `active`.
@@ -308,12 +380,24 @@ well. A consumer keeps the highest revision it has seen per watch and **ignores 
 message whose revision is not higher**. That makes redelivered and reordered messages
 harmless.
 
-### 7.4 Idempotent consumers (planned)
+### 7.4 Idempotent consumers
 
 RabbitMQ delivers at least once, and the relay can publish an event twice (see
 [8](#8-failure-scenarios)). Each consumer stores the `event_id` values it has
 processed, in the same transaction as the effect of the message, and skips ids it has
 already seen. Messages are acknowledged only after that transaction commits.
+
+In the watcher this is the `processed_events` table. For watch events the revision
+check would already catch most duplicates; the event id makes it hold for any event
+type, including ones that carry no revision.
+
+Ack policy in the watcher's consumer:
+
+- handled, or a duplicate: **ack**;
+- an error while handling (e.g. the database is briefly unavailable): **nack and
+  requeue**, so it's tried again;
+- a message that can never be handled (unknown routing key, invalid payload): **reject
+  without requeue**, so it can't block the queue.
 
 ### 7.5 Bootstrap, then follow
 
@@ -344,30 +428,38 @@ Everything runs locally with `docker compose up --build`:
 
 | Container | Image | Notes |
 |---|---|---|
-| `db` | `postgres:17` | Database `core`. Planned: one database per service in the same server. |
+| `db` | `postgres:17` | One server, one database per service: `core` and `watcher`. Created by `docker/postgres/create-databases.sql` on a new volume. |
 | `rabbitmq` | `rabbitmq:4-management` | AMQP on 5672, management UI on 15672. |
 | `core` | built from `services/core/Dockerfile` | Port 8000. Health check on `/api/health`. |
 | `core-relay` | same image | Starts after `core` is healthy (migrations done) and RabbitMQ is up. |
+| `watcher` | built from `services/watcher/Dockerfile` | Port 8001. Runs `alembic upgrade head`, then uvicorn. Doesn't wait for core: it retries the snapshot itself. |
 
-The core image is built from the repo root, because it needs `libs/events`. The
-service's source is mounted into the container, so the web app reloads on code changes
-without a rebuild. The relay needs a restart, and changes to `libs/events` need a rebuild.
+Both images are built from the repo root, because they need `libs/events`. The
+services' source is mounted into the containers. core's web app reloads on code changes;
+the relay and the watcher need a restart, and changes to `libs/events` need a rebuild.
 
 Configuration comes from environment variables (`DATABASE_URL`, `RABBITMQ_URL`,
 `REBRICKABLE_API_KEY`, `DJANGO_*`), with a `.env` file in the repo root for local
-values. Without `DATABASE_URL`, core falls back to SQLite.
+values. Without `DATABASE_URL`, core falls back to SQLite. The watcher reads
+`WATCHER_*` variables (`WATCHER_DATABASE_URL`, `WATCHER_RABBITMQ_URL`, `WATCHER_CORE_URL`,
+`WATCHER_HOME_POSTCODE`, `WATCHER_SOURCES`, `WATCHER_POLL_INTERVAL_SECONDS`), and falls
+back to a local SQLite file.
 
 ## 10. Testing
 
 | Level | What | How |
 |---|---|---|
 | Contracts | Round trip through JSON, unknown fields ignored, invalid messages rejected, unique routing keys | `libs/events/tests` |
-| Unit | Importer, wanted list, watches and their events, outbox relay | Fake Rebrickable API (`httpx.MockTransport`) and a fake publisher; no network |
+| Unit, core | Importer, wanted list, watches and their events, outbox relay | Fake Rebrickable API (`httpx.MockTransport`) and a fake publisher; no network |
+| Unit, watcher | Matching, distances, watch copies by revision, polling and price drops, outbox, HTTP endpoints | In-memory SQLite (PostgreSQL in CI), the fake source, a fake publisher |
+| Consumer | Watch events through the exchange into the watcher; unreadable messages rejected | FastStream's in-memory `TestRabbitBroker` |
 | Integration | Publishing through a real RabbitMQ and reading it back | Runs when `RABBITMQ_URL` is set |
-| End-to-end (planned) | Create a watch → the watcher's fake source finds a listing → the notifier receives `listing.matched` | Against the full docker-compose stack |
+| End-to-end | Watch created in core → arrives in the watcher → fake listing polled → `listing.matched` and `listing.price_dropped` on RabbitMQ | By hand against docker-compose so far; automating it, with the notifier, is planned |
 
-CI (GitHub Actions) runs the contract tests, and the core tests against real PostgreSQL
-and RabbitMQ, on every push. It also fails if a model change has no migration.
+CI (GitHub Actions) runs on every push: the contract tests, the core tests against
+real PostgreSQL and RabbitMQ, and the watcher tests against real PostgreSQL. It also
+fails if a model change in either service has no migration (`makemigrations --check`,
+`alembic check`).
 
 ## 11. Design decisions
 
@@ -421,3 +513,13 @@ contracts only: no logic, no database code.
 - **A failed save leaves the in-memory revision raised.** If `Watch.save()` rolls back,
   the instance's `revision` is one too high. The next save reads it from the database
   again, so it doesn't end up in an event.
+- **Outbox code exists twice.** core (Django ORM) and the watcher (SQLAlchemy) each
+  have their own small outbox. Sharing it would mean a shared library with database
+  code in it, which is the coupling `libs/events` is meant to avoid.
+- **Requeued errors retry immediately.** A message that keeps failing for a reason
+  other than being unreadable is requeued over and over. Delayed retries and a
+  dead-letter queue are planned.
+- **The fake source forgets on restart.** Its listings live in memory; what the watcher
+  stored about them stays in its database.
+- **Incomplete-set words are naive.** "compleet, niets ontbreekt" contains *ontbreekt*,
+  so it looks incomplete. That only matters for watches that refuse incomplete sets.

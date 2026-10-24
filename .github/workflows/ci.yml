@@ -53,3 +53,33 @@ jobs:
       - run: pip install ../../libs/events ".[dev]"
       - run: python manage.py makemigrations --check --dry-run
       - run: pytest
+
+  watcher:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_DB: watcher
+          POSTGRES_USER: lego
+          POSTGRES_PASSWORD: lego
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U lego"
+          --health-interval 5s
+          --health-retries 10
+    env:
+      WATCHER_DATABASE_URL: postgresql+psycopg://lego:lego@localhost:5432/watcher
+      WATCHER_TEST_DATABASE_URL: postgresql+psycopg://lego:lego@localhost:5432/watcher
+    defaults:
+      run:
+        working-directory: services/watcher
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install ../../libs/events ".[dev]"
+      - name: Migrations are complete
+        run: alembic upgrade head && alembic check
+      - run: pytest

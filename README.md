@@ -18,6 +18,10 @@ when a new one shows up.
 - **Export a BrickLink wanted list** for any selection of owned sets. Identical parts
   are combined across sets; parts without a BrickLink mapping are reported, not
   silently dropped.
+- **Watch for sets**: "6086-1, max €150 including shipping, within 50 km of Genk".
+  The watcher service polls its sources, recognizes the set number in listing titles,
+  works out the total price and the distance from home, and announces new matches and
+  price drops as events. Its only source so far is a fake marketplace for demos.
 
 ## Architecture
 
@@ -28,7 +32,7 @@ purpose, to practise service boundaries and reliable messaging on a domain I kno
 ```
                  ┌──────────────────┐  watch.upserted / watch.deleted   ┌─────────────┐
   me ──admin──►  │ core (Django)    │ ──────────────┐                    │ watcher     │ ◄── eBay
-                 │ catalog          │               ▼                    │ (planned)   │
+                 │ catalog          │               ▼                    │             │
                  │ collection       │       ┌───────────────┐ ────────►  │             │
                  │ watches, outbox  │ ◄──── │ RabbitMQ      │ ◄────────  └─────────────┘
                  └────────┬─────────┘       │ "lego.events" │  listing.matched
@@ -44,7 +48,7 @@ purpose, to practise service boundaries and reliable messaging on a domain I kno
 |---|---|---|
 | `services/core` | Catalog, owned sets, missing parts, watches; publishes watch events | Django, django-ninja, PostgreSQL |
 | `libs/events` | Event contracts shared by every service | pydantic |
-| `services/watcher` | Polls marketplaces, deduplicates, publishes matches (planned) | FastAPI, FastStream, SQLAlchemy |
+| `services/watcher` | Polls marketplaces, deduplicates, matches listings to watches, publishes matches and price drops | FastAPI, FastStream, SQLAlchemy, Alembic, PostgreSQL |
 | `services/notifier` | Sends Telegram messages for matches (planned) | FastAPI, FastStream |
 
 **How events stay reliable**
@@ -85,7 +89,22 @@ docker compose exec core python manage.py createsuperuser
 
 - Admin: http://localhost:8000/admin/
 - API docs: http://localhost:8000/api/docs
+- Watcher API docs: http://localhost:8001/docs
 - RabbitMQ: http://localhost:15672 (lego / lego)
+
+To see a match: create a watch for 6086-1 in the admin, then put a listing on the fake
+marketplace and poll it:
+
+```bash
+curl -X POST localhost:8001/sources/fake/listings -H 'Content-Type: application/json' \
+  -d '{"external_id": "demo-1", "title": "LEGO 6086 kasteel compleet", "url": "https://example.test",
+       "price": "120", "shipping": "0", "postcode": "3500"}'
+curl -X POST localhost:8001/sources/fake/poll
+curl 'localhost:8001/listings?matched=true'
+```
+
+The `listing.matched` event shows up in the RabbitMQ UI. Post the same listing with a
+lower price and poll again for a `listing.price_dropped`.
 
 Without Docker (Python 3.12+, SQLite, no events published):
 
@@ -98,20 +117,22 @@ python manage.py migrate
 python manage.py runserver
 ```
 
-Tests: run `pytest` in `libs/events` and in `services/core`. The RabbitMQ round-trip
-test only runs when `RABBITMQ_URL` is set; CI runs everything against PostgreSQL
-and RabbitMQ.
+Tests: run `pytest` in `libs/events`, `services/core` and `services/watcher`
+(`pip install -e "services/watcher[dev]"` first). Locally they use SQLite and
+in-memory fakes. The RabbitMQ round-trip test in core only runs when `RABBITMQ_URL`
+is set; CI runs everything against PostgreSQL and RabbitMQ.
 
 ## Roadmap
 
 - [x] **Watches**: "set 6086-1, max €150 incl. shipping, within 50 km of Genk", published as events.
-- [ ] **Watcher service** with a fake source first, deduplication and `listing.matched` events.
+- [x] **Watcher service** with a fake source, deduplication, distance from home, and
+      `listing.matched` / `listing.price_dropped` events.
 - [ ] **Notifier service** with Telegram, retries and a dead-letter queue.
-- [ ] **Marketplace sources** as pluggable modules, starting with eBay's official Browse API.
+- [ ] **Email alerts source**: saved-search alerts from 2dehands and Marktplaats, read over IMAP.
+- [ ] **eBay source** through the official Browse API.
       Sites without a public API only via their own saved-search email alerts, not scraping.
-- [ ] **De-duplication and price tracking**: recognize the same listing across polls, track
-      price drops, compute total price including shipping and distance from home.
+- [ ] **Offers in core**: show matched listings in the admin, next to the watch.
 - [ ] **Deal score** against typical BrickLink prices.
 - [ ] Daily digest of new matches.
-- [ ] **Scheduled polling** with retries and per-source rate limits.
+- [ ] **Per-source rate limits** and back-off for real marketplaces.
 - [ ] Minifigures in set inventories.

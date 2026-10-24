@@ -5,11 +5,15 @@ routing key. Consumers bind queues to the keys (or patterns like ``watch.*``) th
 care about.
 """
 from .base import EXCHANGE, Event, UnknownEventError, parse
+from .listings import ListingMatched, ListingPriceDropped, ListingSnapshot
 from .watches import WatchDeleted, WatchState, WatchUpserted
 
 __all__ = [
     "EXCHANGE",
     "Event",
+    "ListingMatched",
+    "ListingPriceDropped",
+    "ListingSnapshot",
     "UnknownEventError",
     "WatchDeleted",
     "WatchState",

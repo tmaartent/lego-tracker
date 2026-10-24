@@ -8,3 +8,4 @@ staticfiles/
 *.egg-info/
 build/
 .idea/
+watcher.db
