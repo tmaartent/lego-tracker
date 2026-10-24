@@ -1,0 +1,11 @@
+.git/
+.github/
+.venv/
+.env
+.pytest_cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+db.sqlite3
+staticfiles/

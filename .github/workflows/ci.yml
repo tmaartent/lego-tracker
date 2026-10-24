@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_DB: lego
+          POSTGRES_USER: lego
+          POSTGRES_PASSWORD: lego
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U lego"
+          --health-interval 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://lego:lego@localhost:5432/lego
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install ".[dev]"
+      - run: python manage.py makemigrations --check --dry-run
+      - run: pytest
