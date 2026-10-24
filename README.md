@@ -64,6 +64,9 @@ purpose, to practise service boundaries and reliable messaging on a domain I kno
 - **Bootstrap, then follow.** A new consumer loads the current watches from
   `GET /api/watches/` and keeps up through events from then on.
 
+The full design, with the event catalog, failure scenarios and design decisions, is in
+[docs/architecture.md](docs/architecture.md).
+
 Inside core, **catalog** is reference data mirrored from Rebrickable and
 **collection** is my own data, so a catalog re-import never touches what I own.
 The Rebrickable client takes an injectable `httpx.Client`, so tests run against an
