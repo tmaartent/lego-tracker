@@ -5,13 +5,26 @@ on:
   pull_request:
 
 jobs:
-  test:
+  events:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: libs/events
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install ".[dev]"
+      - run: pytest
+
+  core:
     runs-on: ubuntu-latest
     services:
       postgres:
         image: postgres:17
         env:
-          POSTGRES_DB: lego
+          POSTGRES_DB: core
           POSTGRES_USER: lego
           POSTGRES_PASSWORD: lego
         ports: ["5432:5432"]
@@ -19,13 +32,24 @@ jobs:
           --health-cmd "pg_isready -U lego"
           --health-interval 5s
           --health-retries 10
+      rabbitmq:
+        image: rabbitmq:4
+        ports: ["5672:5672"]
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
+          --health-interval 5s
+          --health-retries 20
     env:
-      DATABASE_URL: postgres://lego:lego@localhost:5432/lego
+      DATABASE_URL: postgres://lego:lego@localhost:5432/core
+      RABBITMQ_URL: amqp://guest:guest@localhost:5672/%2F
+    defaults:
+      run:
+        working-directory: services/core
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-      - run: pip install ".[dev]"
+      - run: pip install ../../libs/events ".[dev]"
       - run: python manage.py makemigrations --check --dry-run
       - run: pytest

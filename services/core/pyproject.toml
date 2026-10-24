@@ -1,13 +1,16 @@
 [project]
-name = "lego-tracker"
+name = "lego-tracker-core"
 version = "0.1.0"
-description = "Track second-hand LEGO sets, the parts they're missing, and BrickLink wanted lists to complete them."
+description = "Owned sets, missing parts, BrickLink wanted lists and watches for second-hand LEGO."
 requires-python = ">=3.12"
 dependencies = [
+    "lego-events",
     "django>=5.2,<6",
+    "django-ninja>=1.3",
     "dj-database-url>=2.2",
     "psycopg[binary]>=3.2",
     "httpx>=0.27",
+    "pika>=1.3",
     "python-dotenv>=1.0",
 ]
 
@@ -22,8 +25,9 @@ requires = ["setuptools>=69"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["config*", "catalog*", "collection*"]
+include = ["config*", "catalog*", "collection*", "outbox*", "watches*"]
 
 [tool.pytest.ini_options]
 DJANGO_SETTINGS_MODULE = "config.settings"
 testpaths = ["tests"]
+markers = ["rabbitmq: needs a running RabbitMQ (set RABBITMQ_URL)"]

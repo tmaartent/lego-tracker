@@ -3,12 +3,12 @@ import os
 from pathlib import Path
 
 import dj_database_url
-from dotenv import load_dotenv
+from dotenv import find_dotenv, load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-# Real environment variables (docker-compose, CI) win over .env.
-load_dotenv(BASE_DIR / ".env")
+# Real environment variables (docker-compose, CI) win over .env, which lives in the repo root.
+load_dotenv(find_dotenv(usecwd=True))
 
 SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY", "dev-only-not-secret")
 DEBUG = os.environ.get("DJANGO_DEBUG", "1") == "1"
@@ -23,6 +23,8 @@ INSTALLED_APPS = [
     "django.contrib.staticfiles",
     "catalog",
     "collection",
+    "outbox",
+    "watches",
 ]
 
 MIDDLEWARE = [
@@ -77,3 +79,4 @@ STATIC_ROOT = BASE_DIR / "staticfiles"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 REBRICKABLE_API_KEY = os.environ.get("REBRICKABLE_API_KEY", "")
+RABBITMQ_URL = os.environ.get("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/%2F")
