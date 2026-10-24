@@ -31,7 +31,7 @@ def relay_batch(publisher: Publisher, batch_size: int = 100) -> int:
                 publisher.publish(
                     row.routing_key,
                     json.dumps(row.payload).encode(),
-                    message_id=str(row.id),
+                    message_id=str(row.event_id),
                 )
             except Exception as exc:
                 error = exc
