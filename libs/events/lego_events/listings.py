@@ -36,6 +36,8 @@ class ListingMatched(Event):
 
     watch_id: int
     set_num: str
+    # Added after the first version; optional so older messages still parse.
+    set_name: str | None = None
     listing: ListingSnapshot
 
 
@@ -46,6 +48,8 @@ class ListingPriceDropped(Event):
 
     watch_id: int
     set_num: str
+    # Added after the first version; optional so older messages still parse.
+    set_name: str | None = None
     listing: ListingSnapshot
     previous_total_price: Decimal
 

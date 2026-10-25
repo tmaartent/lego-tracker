@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from .db import utcnow
 from .matching import Verdict, evaluate
-from .models import Listing, Match
+from .models import Listing, Match, WatchCopy
 from .outbox import enqueue
 from .sources import FoundListing, Source
 from .watches import live_watches
@@ -41,7 +41,7 @@ async def poll(sessions: async_sessionmaker[AsyncSession], source: Source, home_
                 verdict = evaluate(listing, watch, home_postcode)
                 if not verdict.matches:
                     continue
-                outcome = await _record_match(session, listing, watch.watch_id, watch.set_num, verdict)
+                outcome = await _record_match(session, listing, watch, verdict)
                 new_matches += outcome == "matched"
                 price_drops += outcome == "price_dropped"
     return PollResult(len(found), new_listings, new_matches, price_drops)
@@ -62,26 +62,20 @@ async def _upsert(session: AsyncSession, source: str, item: FoundListing) -> tup
     return listing, is_new
 
 
-async def _record_match(
-    session: AsyncSession, listing: Listing, watch_id: int, set_num: str, verdict: Verdict
-) -> str | None:
+async def _record_match(session: AsyncSession, listing: Listing, watch: WatchCopy, verdict: Verdict) -> str | None:
     snapshot = _snapshot(listing, verdict)
-    match = next((m for m in listing.matches if m.watch_id == watch_id), None)
+    about = dict(watch_id=watch.watch_id, set_num=watch.set_num, set_name=watch.set_name)
+    match = next((m for m in listing.matches if m.watch_id == watch.watch_id), None)
 
     if match is None:
-        listing.matches.append(Match(watch_id=watch_id, total_price=snapshot.total_price))
-        enqueue(session, ListingMatched(watch_id=watch_id, set_num=set_num, listing=snapshot))
+        listing.matches.append(Match(watch_id=watch.watch_id, total_price=snapshot.total_price))
+        enqueue(session, ListingMatched(**about, listing=snapshot))
         return "matched"
 
     if snapshot.total_price < match.total_price:
         enqueue(
             session,
-            ListingPriceDropped(
-                watch_id=watch_id,
-                set_num=set_num,
-                listing=snapshot,
-                previous_total_price=match.total_price,
-            ),
+            ListingPriceDropped(**about, listing=snapshot, previous_total_price=match.total_price),
         )
         match.total_price = snapshot.total_price
         return "price_dropped"
