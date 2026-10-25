@@ -6,6 +6,7 @@ x-core: &core
   environment:
     DATABASE_URL: postgres://lego:lego@db:5432/core
     RABBITMQ_URL: amqp://lego:lego@rabbitmq:5672/%2F
+    DJANGO_ALLOWED_HOSTS: localhost,127.0.0.1,core   # core: the watcher calls it by service name
   volumes:
     - ./services/core:/app
 
