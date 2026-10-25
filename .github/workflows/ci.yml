@@ -83,3 +83,41 @@ jobs:
       - name: Migrations are complete
         run: alembic upgrade head && alembic check
       - run: pytest
+
+  notifier:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_DB: notifier
+          POSTGRES_USER: lego
+          POSTGRES_PASSWORD: lego
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U lego"
+          --health-interval 5s
+          --health-retries 10
+      rabbitmq:
+        image: rabbitmq:4
+        ports: ["5672:5672"]
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
+          --health-interval 5s
+          --health-retries 20
+    env:
+      NOTIFIER_DATABASE_URL: postgresql+psycopg://lego:lego@localhost:5432/notifier
+      NOTIFIER_TEST_DATABASE_URL: postgresql+psycopg://lego:lego@localhost:5432/notifier
+      NOTIFIER_TEST_RABBITMQ_URL: amqp://guest:guest@localhost:5672/
+    defaults:
+      run:
+        working-directory: services/notifier
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install ../../libs/events ".[dev]"
+      - name: Migrations are complete
+        run: alembic upgrade head && alembic check
+      - run: pytest

@@ -3,8 +3,8 @@
 I buy old LEGO sets second-hand. They're rarely complete, and the good deals go fast.
 This app keeps track of the sets I own, which parts each one is missing, and turns
 those missing parts into a BrickLink wanted list so I can order them in one go.
-Now in progress: watching second-hand marketplaces for cheap, nearby offers and notifying me
-when a new one shows up.
+It also watches second-hand marketplaces for cheap, nearby offers and notifies me on
+Telegram when a new one shows up.
 
 ## What works today
 
@@ -22,6 +22,9 @@ when a new one shows up.
   The watcher service polls its sources, recognizes the set number in listing titles,
   works out the total price and the distance from home, and announces new matches and
   price drops as events. Its only source so far is a fake marketplace for demos.
+- **Get notified on Telegram** of every new match and price drop. Failed sends are
+  retried with increasing delays; messages that keep failing wait in a dead-letter
+  queue until they're replayed.
 
 ## Architecture
 
@@ -40,7 +43,7 @@ purpose, to practise service boundaries and reliable messaging on a domain I kno
                           ▼                         ▼
                    Postgres (core)          ┌─────────────┐
                                             │ notifier    │ ──► Telegram
-                                            │ (planned)   │
+                                            │             │
                                             └─────────────┘
 ```
 
@@ -49,7 +52,7 @@ purpose, to practise service boundaries and reliable messaging on a domain I kno
 | `services/core` | Catalog, owned sets, missing parts, watches; publishes watch events | Django, django-ninja, PostgreSQL |
 | `libs/events` | Event contracts shared by every service | pydantic |
 | `services/watcher` | Polls marketplaces, deduplicates, matches listings to watches, publishes matches and price drops | FastAPI, FastStream, SQLAlchemy, Alembic, PostgreSQL |
-| `services/notifier` | Sends Telegram messages for matches (planned) | FastAPI, FastStream |
+| `services/notifier` | Sends Telegram messages for matches and price drops, with delayed retries and a dead-letter queue | FastAPI, FastStream, SQLAlchemy, Alembic, PostgreSQL |
 
 **How events stay reliable**
 
@@ -90,6 +93,7 @@ docker compose exec core python manage.py createsuperuser
 - Admin: http://localhost:8000/admin/
 - API docs: http://localhost:8000/api/docs
 - Watcher API docs: http://localhost:8001/docs
+- Notifier API docs: http://localhost:8002/docs
 - RabbitMQ: http://localhost:15672 (lego / lego)
 
 To see a match: create a watch for 6086-1 in the admin, then put a listing on the fake
@@ -103,8 +107,13 @@ curl -X POST localhost:8001/sources/fake/poll
 curl 'localhost:8001/listings?matched=true'
 ```
 
-The `listing.matched` event shows up in the RabbitMQ UI. Post the same listing with a
-lower price and poll again for a `listing.price_dropped`.
+The notifier sends it, or logs it if Telegram isn't set up (`docker compose logs notifier`).
+Post the same listing with a lower price and poll again for a price drop.
+
+To get the messages on Telegram: create a bot with [@BotFather](https://t.me/BotFather),
+put its token in `.env` as `NOTIFIER_TELEGRAM_BOT_TOKEN`, send the bot a message, and
+find your chat id with `docker compose exec notifier python -m notifier.find_chat_id`.
+Put that in `.env` as `NOTIFIER_TELEGRAM_CHAT_ID` and run `docker compose up -d notifier`.
 
 Without Docker (Python 3.12+, SQLite, no events published):
 
@@ -117,17 +126,18 @@ python manage.py migrate
 python manage.py runserver
 ```
 
-Tests: run `pytest` in `libs/events`, `services/core` and `services/watcher`
-(`pip install -e "services/watcher[dev]"` first). Locally they use SQLite and
-in-memory fakes. The RabbitMQ round-trip test in core only runs when `RABBITMQ_URL`
-is set; CI runs everything against PostgreSQL and RabbitMQ.
+Tests: run `pytest` in `libs/events` and in each service under `services/`
+(`pip install -e "services/<name>[dev]"` first). Locally they use SQLite and
+in-memory fakes. The tests against a real RabbitMQ only run when `RABBITMQ_URL` (core)
+or `NOTIFIER_TEST_RABBITMQ_URL` (notifier) is set; CI runs everything against
+PostgreSQL and RabbitMQ.
 
 ## Roadmap
 
 - [x] **Watches**: "set 6086-1, max €150 incl. shipping, within 50 km of Genk", published as events.
 - [x] **Watcher service** with a fake source, deduplication, distance from home, and
       `listing.matched` / `listing.price_dropped` events.
-- [ ] **Notifier service** with Telegram, retries and a dead-letter queue.
+- [x] **Notifier service** with Telegram, delayed retries and a dead-letter queue.
 - [ ] **Email alerts source**: saved-search alerts from 2dehands and Marktplaats, read over IMAP.
 - [ ] **eBay source** through the official Browse API.
       Sites without a public API only via their own saved-search email alerts, not scraping.

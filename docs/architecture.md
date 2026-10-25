@@ -13,7 +13,7 @@ the code today.
 2. [Services at a glance](#2-services-at-a-glance)
 3. [core](#3-core)
 4. [watcher](#4-watcher)
-5. [notifier (planned)](#5-notifier-planned)
+5. [notifier](#5-notifier)
 6. [Messaging](#6-messaging)
 7. [Reliability](#7-reliability)
 8. [Failure scenarios](#8-failure-scenarios)
@@ -58,7 +58,7 @@ asynchronous messaging and the failure handling that comes with it.
                           ▼                         ▼
                    Postgres (core)          ┌─────────────┐
                                             │ notifier    │ ──► Telegram
-                                            │ (planned)   │
+                                            │             │
                                             └─────────────┘
 ```
 
@@ -66,7 +66,7 @@ asynchronous messaging and the failure handling that comes with it.
 |---|---|---|---|---|
 | **core** | Catalog, owned sets, missing parts, watches, offers | `watch.*` | `listing.*` (planned) | Django, django-ninja, PostgreSQL |
 | **watcher** | Listings seen on marketplaces, its copy of the watches | `listing.*` | `watch.*` | FastAPI, FastStream, SQLAlchemy, PostgreSQL |
-| **notifier** (planned) | Which notifications were sent | none | `listing.matched` | FastAPI, FastStream, PostgreSQL |
+| **notifier** | Which notifications were sent | none | `listing.*` | FastAPI, FastStream, PostgreSQL |
 | **libs/events** | The event contracts | n/a | n/a | pydantic |
 
 **Data ownership rule:** every service has its own database and is the only one that
@@ -262,15 +262,77 @@ OpenAPI docs at `/docs`.
 | `POST /sources/{name}/poll` | Poll one source now instead of waiting for the schedule. |
 | `POST /sources/fake/listings` | Put a listing on the fake marketplace. Reusing an `external_id` changes that listing, e.g. to demo a price drop. |
 
-## 5. notifier (planned)
+## 5. notifier
 
-Sends a Telegram message for every `listing.matched`.
+Sends a Telegram message for every `listing.matched` and `listing.price_dropped`. A
+FastAPI app with a FastStream consumer in the same process.
 
-- Consumes `listing.matched` from its own queue.
-- Deduplicates on `event_id`, so a redelivered event doesn't buzz twice.
-- If Telegram is unavailable: a few delayed retries, then the message goes to a
-  dead-letter queue that can be inspected and replayed.
-- HTTP endpoints for health and for inspecting the dead-letter queue.
+### 5.1 Modules
+
+| Module | Job |
+|---|---|
+| `consumer.py` | FastStream subscriber on `notifier.listings`; turns a decision into ack, retry or dead letter. |
+| `handling.py` | What to do with one event: send it, skip a duplicate, retry, or give up. No RabbitMQ in it. |
+| `messages.py` | The message text, in Telegram's HTML subset. Everything from a seller is escaped. |
+| `channels.py` | `TelegramChannel` (Bot API `sendMessage`) and `ConsoleChannel` (logs; used when Telegram isn't configured). |
+| `topology.py` | The main, retry and dead-letter queues. |
+| `dead_letters.py` | Count, peek at and replay the dead-letter queue. |
+| `find_chat_id.py` | Helper to find your Telegram chat id after messaging the bot. |
+
+Its own PostgreSQL database `notifier` has one table, `notifications`: every
+notification sent, keyed by event id, with the channel, the text and how many attempts
+it took.
+
+### 5.2 Failures: temporary or permanent
+
+| Failure | Examples | What happens |
+|---|---|---|
+| Temporary | Network error, Telegram 429 (rate limit), 5xx | Retried after 10 s, 60 s, then 300 s. After that, dead letter. |
+| Permanent | Telegram 400/401/403: wrong token, unknown chat | Straight to the dead-letter queue: retrying won't help until someone fixes the settings. |
+| Unreadable | Unknown event type, invalid payload | Rejected; the queue dead-letters it. |
+
+Error messages never contain the bot token (it's part of the Telegram URL).
+
+### 5.3 Delayed retries without a plugin
+
+```
+lego.events ──listing.*──► notifier.listings ──(reject)──► notifier.listings.dead
+                             ▲        │
+                             │        └─(temporary failure)─► notifier.listings.retry.<N>s
+                             │                                        │
+                             └──────────── after N seconds (TTL) ─────┘
+```
+
+- Each retry delay has its own queue, with a message TTL and no consumers. When a
+  message expires, RabbitMQ dead-letters it back to `notifier.listings` through the
+  default exchange.
+- On a temporary failure, the consumer publishes a copy to the right retry queue with
+  an attempt counter (`x-notifier-attempt`) and the error (`x-notifier-error`) in the
+  headers, then acks the original. If that publish fails, the original is nacked
+  instead, so nothing is lost.
+- A retried message comes back with the queue name as its routing key, so the event
+  type is read from the message's `type` property, which every publisher sets.
+- The retry and dead-letter queues are declared before consuming starts, so the very
+  first failure has somewhere to go.
+
+### 5.4 Sending exactly once, almost
+
+Before sending, the notifier checks `notifications` for the event id; after Telegram
+accepts the message, it records it. A redelivered event is therefore skipped. One gap
+remains: if the process dies after Telegram accepted the message but before it's
+recorded, the event is redelivered and sent again. A rare duplicate message is the
+price of never losing one silently.
+
+### 5.5 HTTP endpoints
+
+OpenAPI docs at `/docs`.
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /health` | Liveness, and which channel is active (`telegram` or `console`). |
+| `GET /notifications` | Recently sent notifications. |
+| `GET /dead-letters` | How many messages gave up, and the first few with their error. Peeking leaves them in the queue. |
+| `POST /dead-letters/replay` | Move every dead letter back to the main queue as a fresh attempt, e.g. after fixing the Telegram settings. |
 
 ## 6. Messaging
 
@@ -286,9 +348,11 @@ Sends a Telegram message for every `listing.matched`.
 |---|---|---|---|
 | `watcher.watches` | `watch.*` | watcher | built |
 | `core.listings` | `listing.*` | core | planned |
-| `notifier.matches` | `listing.matched` | notifier | planned |
+| `notifier.listings` | `listing.*` | notifier | built |
+| `notifier.listings.retry.<N>s` | (none: filled by the notifier, TTL back to `notifier.listings`) | notifier | built |
+| `notifier.listings.dead` | (none: dead letters from the notifier) | notifier | built |
 
-Planned: a dead-letter exchange and a queue per consumer for messages that keep failing.
+The notifier has delayed retries and a dead-letter queue (see [5.3](#53-delayed-retries-without-a-plugin)). The watcher doesn't yet.
 
 Messages are persistent (`delivery_mode=2`). Properties: `content_type` is
 `application/json`, `message_id` is the event id, `type` is the routing key.
@@ -312,7 +376,7 @@ rejects unknown routing keys and invalid payloads.
 |---|---|---|---|
 | `watch.upserted` | core | `watch: WatchState` | built |
 | `watch.deleted` | core | `watch_id`, `revision` | built |
-| `listing.matched` | watcher | `watch_id`, `set_num`, `listing: ListingSnapshot` | built |
+| `listing.matched` | watcher | `watch_id`, `set_num`, `set_name`, `listing: ListingSnapshot` | built |
 | `listing.price_dropped` | watcher | as above, plus `previous_total_price` | built |
 
 `WatchState`: `watch_id`, `revision`, `set_num`, `set_name`, `max_total_price`,
@@ -322,6 +386,8 @@ rejects unknown routing keys and invalid payloads.
 
 - **Adding a field** is safe. Consumers ignore fields they don't know
   (`extra="ignore"`), so producers can be deployed first.
+  Example: `set_name` was added to the listing events after the first version, as an
+  optional field, so messages without it still parse.
 - **Removing, renaming or changing a field** is a breaking change. It gets a new
   routing key (e.g. `watch.upserted.v2`), and the producer publishes both versions until
   every consumer has moved over.
@@ -419,8 +485,10 @@ from RabbitMQ: a message is gone once it's consumed. So:
 | A publish fails halfway through a batch | Earlier rows are committed as published; the rest wait. | No duplicates for the earlier rows, order kept. |
 | Consumer crashes while handling a message | The message wasn't acknowledged, so RabbitMQ redelivers it. | Handled again; idempotency keeps it to one effect. |
 | Consumer gets an old or repeated watch event | Revision not higher than what it has. | Ignored. |
-| Telegram is down (planned) | Delayed retries, then the dead-letter queue. | Visible and replayable, not lost. |
-| A message can't be parsed | Rejected without requeue (planned: to the dead-letter queue). | Doesn't block the queue. |
+| Telegram is down or rate-limits | Retries after 10 s, 60 s and 300 s, then the dead-letter queue. | Visible and replayable, not lost. |
+| Telegram token or chat id is wrong | Straight to the dead-letter queue. | Fix the settings, then replay. |
+| Notifier dies after Telegram accepted a message | Not recorded as sent, so it's redelivered. | Sent twice; rare, and never lost. |
+| A message can't be parsed | Rejected without requeue; in the notifier it lands in the dead-letter queue. | Doesn't block the queue. |
 
 ## 9. Deployment
 
@@ -428,10 +496,11 @@ Everything runs locally with `docker compose up --build`:
 
 | Container | Image | Notes |
 |---|---|---|
-| `db` | `postgres:17` | One server, one database per service: `core` and `watcher`. Created by `docker/postgres/create-databases.sql` on a new volume. |
+| `db` | `postgres:17` | One server, one database per service: `core`, `watcher` and `notifier`. Created by `docker/postgres/create-databases.sql` on a new volume. |
 | `rabbitmq` | `rabbitmq:4-management` | AMQP on 5672, management UI on 15672. |
 | `core` | built from `services/core/Dockerfile` | Port 8000. Health check on `/api/health`. |
 | `core-relay` | same image | Starts after `core` is healthy (migrations done) and RabbitMQ is up. |
+| `notifier` | built from `services/notifier/Dockerfile` | Port 8002. Runs `alembic upgrade head`, then uvicorn. Telegram settings come from `.env`. |
 | `watcher` | built from `services/watcher/Dockerfile` | Port 8001. Runs `alembic upgrade head`, then uvicorn. Doesn't wait for core: it retries the snapshot itself. |
 
 Both images are built from the repo root, because they need `libs/events`. The
@@ -454,11 +523,13 @@ back to a local SQLite file.
 | Unit, watcher | Matching, distances, watch copies by revision, polling and price drops, outbox, HTTP endpoints | In-memory SQLite (PostgreSQL in CI), the fake source, a fake publisher |
 | Consumer | Watch events through the exchange into the watcher; unreadable messages rejected | FastStream's in-memory `TestRabbitBroker` |
 | Integration | Publishing through a real RabbitMQ and reading it back | Runs when `RABBITMQ_URL` is set |
-| End-to-end | Watch created in core → arrives in the watcher → fake listing polled → `listing.matched` and `listing.price_dropped` on RabbitMQ | By hand against docker-compose so far; automating it, with the notifier, is planned |
+| Retries on a real broker | A temporary failure comes back after its delay and is sent; a message that keeps failing lands in the dead-letter queue, survives a peek, and is sent after a replay | Notifier tests against real RabbitMQ, when `NOTIFIER_TEST_RABBITMQ_URL` is set |
+| End-to-end | Watch created in core → watcher → fake listing polled → notifier sends the match and the price drop | By hand against docker-compose; automating it is planned |
 
 CI (GitHub Actions) runs on every push: the contract tests, the core tests against
-real PostgreSQL and RabbitMQ, and the watcher tests against real PostgreSQL. It also
-fails if a model change in either service has no migration (`makemigrations --check`,
+real PostgreSQL and RabbitMQ, the watcher tests against real PostgreSQL, and the
+notifier tests against real PostgreSQL and RabbitMQ. It also fails if a model change
+in any service has no migration (`makemigrations --check`,
 `alembic check`).
 
 ## 11. Design decisions
@@ -516,10 +587,13 @@ contracts only: no logic, no database code.
 - **Outbox code exists twice.** core (Django ORM) and the watcher (SQLAlchemy) each
   have their own small outbox. Sharing it would mean a shared library with database
   code in it, which is the coupling `libs/events` is meant to avoid.
-- **Requeued errors retry immediately.** A message that keeps failing for a reason
-  other than being unreadable is requeued over and over. Delayed retries and a
-  dead-letter queue are planned.
+- **The watcher's requeued errors retry immediately.** A watch event that keeps
+  failing for a reason other than being unreadable is requeued over and over. The
+  notifier's retry queues could be reused there.
 - **The fake source forgets on restart.** Its listings live in memory; what the watcher
   stored about them stays in its database.
 - **Incomplete-set words are naive.** "compleet, niets ontbreekt" contains *ontbreekt*,
   so it looks incomplete. That only matters for watches that refuse incomplete sets.
+- **The notifier's retry route is tied to fixed queue names.** Its RabbitMQ integration
+  tests use the real queue names, so they can't run while a notifier consumes from the
+  same broker.

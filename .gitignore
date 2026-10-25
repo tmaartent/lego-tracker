@@ -9,3 +9,4 @@ staticfiles/
 build/
 .idea/
 watcher.db
+notifier.db
