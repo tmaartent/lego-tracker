@@ -9,6 +9,7 @@ import asyncio
 import logging
 from collections.abc import Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
+from functools import partial
 
 import httpx
 from fastapi import FastAPI
@@ -21,13 +22,28 @@ from .consumer import subscribe_to_watches
 from .db import make_sessionmaker
 from .outbox import BrokerPublisher, relay_batch
 from .poller import poll
-from .sources import FakeSource, Source
+from .sources import EbaySource, FakeSource, Source
 from .watches import load_snapshot
 
 log = logging.getLogger(__name__)
 
-AVAILABLE_SOURCES: dict[str, Callable[[], Source]] = {
-    "fake": FakeSource,
+def _ebay(settings: Settings) -> EbaySource:
+    if not (settings.ebay_client_id and settings.ebay_client_secret):
+        raise ValueError("The ebay source needs WATCHER_EBAY_CLIENT_ID and WATCHER_EBAY_CLIENT_SECRET")
+    return EbaySource(
+        settings.ebay_client_id,
+        settings.ebay_client_secret.get_secret_value(),
+        home_postcode=settings.home_postcode,
+        marketplace=settings.ebay_marketplace,
+        seller_country=settings.ebay_seller_country,
+        sandbox=settings.ebay_sandbox,
+        poll_interval_seconds=settings.ebay_poll_interval_seconds,
+    )
+
+
+AVAILABLE_SOURCES: dict[str, Callable[[Settings], Source]] = {
+    "fake": lambda settings: FakeSource(),
+    "ebay": _ebay,
 }
 
 
@@ -47,12 +63,8 @@ class Watcher:
         log.info("Polled %s: %s", name, result)
         return result
 
-    async def poll_all(self) -> None:
-        for name in self.sources:
-            try:
-                await self.poll(name)
-            except Exception:
-                log.exception("Polling %s failed; trying again next round", name)
+    def poll_interval(self, name: str) -> float:
+        return self.sources[name].poll_interval_seconds or self.settings.poll_interval_seconds
 
     async def load_snapshot(self) -> None:
         async with httpx.AsyncClient(base_url=self.settings.core_url, timeout=10) as core:
@@ -64,7 +76,7 @@ class Watcher:
 def create_app(settings: Settings | None = None, sources: Sequence[Source] | None = None) -> FastAPI:
     settings = settings or Settings()
     if sources is None:
-        sources = [AVAILABLE_SOURCES[name]() for name in settings.sources]
+        sources = [AVAILABLE_SOURCES[name](settings) for name in settings.sources]
     watcher = Watcher(settings, make_sessionmaker(settings.database_url), sources)
 
     broker = RabbitBroker(settings.rabbitmq_url)
@@ -76,8 +88,12 @@ def create_app(settings: Settings | None = None, sources: Sequence[Source] | Non
         await broker.start()
         tasks = [
             asyncio.create_task(_retry_until_done(watcher.load_snapshot, "loading watches from core")),
-            asyncio.create_task(_every(settings.poll_interval_seconds, watcher.poll_all)),
             asyncio.create_task(_every(settings.relay_interval_seconds, lambda: _relay(watcher, publisher))),
+        ]
+        # Each source on its own schedule, so a slow or failing one doesn't hold up the others.
+        tasks += [
+            asyncio.create_task(_every(watcher.poll_interval(name), partial(watcher.poll, name)))
+            for name in watcher.sources
         ]
         try:
             yield
@@ -85,6 +101,8 @@ def create_app(settings: Settings | None = None, sources: Sequence[Source] | Non
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            for source in watcher.sources.values():
+                await source.aclose()
             await broker.stop()
 
     app = FastAPI(title="lego-tracker watcher", version="0.1.0", lifespan=lifespan)

@@ -46,3 +46,14 @@ async def test_unknown_source(client):
 async def test_invalid_listing_is_refused(client):
     response = await client.post("/sources/fake/listings", json={"external_id": "x", "price": "-5"})
     assert response.status_code == 422
+
+
+def test_each_source_polls_on_its_own_schedule(sessions):
+    class Slow(FakeSource):
+        name = "slow"
+        poll_interval_seconds = 900
+
+    watcher = Watcher(Settings(poll_interval_seconds=60), sessions, [FakeSource(), Slow()])
+
+    assert watcher.poll_interval("fake") == 60
+    assert watcher.poll_interval("slow") == 900

@@ -173,7 +173,7 @@ the poller and the outbox relay run in the same process as background tasks.
 | `app.py` | Wires everything together; the FastAPI lifespan starts the broker, then the background tasks. |
 | `consumer.py` | FastStream subscriber on `watcher.watches`. |
 | `watches.py` | Applies watch events and core's snapshot to the local copy, by revision. |
-| `sources/` | Source adapters behind one `Source` interface. Today: `FakeSource`. |
+| `sources/` | Source adapters behind one `Source` interface: `EbaySource` and `FakeSource`. |
 | `poller.py` | Fetches from a source, stores listings, matches them, announces matches. |
 | `matching.py` | Set number in the title, incomplete-set words, price and distance limits. |
 | `geo.py` | Approximate distance between Belgian postcodes. |
@@ -198,8 +198,9 @@ Its own PostgreSQL database `watcher`, migrated with Alembic.
    collecting in the queue.
 2. Load the snapshot from core's `GET /api/watches/`. If core isn't up yet, retry every
    5 seconds; the rest of the watcher already runs.
-3. Start the background tasks: poll every source on a schedule
-   (`WATCHER_POLL_INTERVAL_SECONDS`), and relay the outbox every second.
+3. Start the background tasks: poll each source on its own schedule (eBay every 15
+   minutes, others every `WATCHER_POLL_INTERVAL_SECONDS`), and relay the outbox every
+   second. A slow or failing source doesn't hold up the others.
 
 ### 4.4 Sources
 
@@ -210,10 +211,26 @@ search API runs a query per watch, an email inbox returns whatever arrived.
 |---|---|---|
 | `fake` | In memory. Listings are added with `POST /sources/fake/listings`, for tests and demos. | built |
 | Email alerts | Reads saved-search alert emails over IMAP. 2dehands and Marktplaats first; Catawiki, Kleinanzeigen, Facebook Marketplace and Vinted only if their alerts turn out to be usable by email. | planned |
-| eBay | The official Browse API. Still to check: whether results include shipping to Belgium, and how precise the item location is. | planned |
+| `ebay` | The official Browse API; see below. | built |
 | BrickLink / Brick Owl | Official APIs, if access is granted (BrickLink requires a seller account). Also a source of typical prices for a deal score. | planned |
 
 Sites without an API are only used through their own email alerts. No scraping.
+
+**eBay.** One search per watched set (`lego 6086`), newest first, on the Belgian
+marketplace (`EBAY_BE`):
+
+- Filters: fixed price or best offer (an auction's current bid isn't a price you can
+  buy at), ships to Belgium, and at most the highest price any watch on the set
+  accepts. Optionally only sellers in one country (`WATCHER_EBAY_SELLER_COUNTRY`).
+- The request says where home is (`X-EBAY-C-ENDUSERCTX`), so shipping costs are
+  quoted for delivery to our postcode. The cheapest option counts; no quote means
+  unknown shipping.
+- Items not priced in euros are skipped.
+- Authentication is an application token (OAuth client credentials) from the keys
+  of a developer account; no eBay user logs in. The token is reused until a minute
+  before it expires, and renewed once if eBay rejects it early.
+- eBay allows 5,000 calls a day. A poll costs one call per watched set, so polling
+  every 15 minutes leaves room for about 50 sets.
 
 ### 4.5 A poll, step by step
 
@@ -489,6 +506,8 @@ from RabbitMQ: a message is gone once it's consumed. So:
 | Telegram token or chat id is wrong | Straight to the dead-letter queue. | Fix the settings, then replay. |
 | Notifier dies after Telegram accepted a message | Not recorded as sent, so it's redelivered. | Sent twice; rare, and never lost. |
 | A message can't be parsed | Rejected without requeue; in the notifier it lands in the dead-letter queue. | Doesn't block the queue. |
+| eBay is down or rate-limits | The poll fails and is logged; nothing is stored. | Tried again at the next poll. Other sources carry on. |
+| eBay keys are wrong | Every eBay poll fails with a message naming the settings to check. | Fix `.env`, restart the watcher. |
 
 ## 9. Deployment
 
@@ -511,8 +530,8 @@ Configuration comes from environment variables (`DATABASE_URL`, `RABBITMQ_URL`,
 `REBRICKABLE_API_KEY`, `DJANGO_*`), with a `.env` file in the repo root for local
 values. Without `DATABASE_URL`, core falls back to SQLite. The watcher reads
 `WATCHER_*` variables (`WATCHER_DATABASE_URL`, `WATCHER_RABBITMQ_URL`, `WATCHER_CORE_URL`,
-`WATCHER_HOME_POSTCODE`, `WATCHER_SOURCES`, `WATCHER_POLL_INTERVAL_SECONDS`), and falls
-back to a local SQLite file.
+`WATCHER_HOME_POSTCODE`, `WATCHER_SOURCES`, `WATCHER_POLL_INTERVAL_SECONDS`, and
+`WATCHER_EBAY_*` for the eBay keys and options), and falls back to a local SQLite file.
 
 ## 10. Testing
 
@@ -521,6 +540,7 @@ back to a local SQLite file.
 | Contracts | Round trip through JSON, unknown fields ignored, invalid messages rejected, unique routing keys | `libs/events/tests` |
 | Unit, core | Importer, wanted list, watches and their events, outbox relay | Fake Rebrickable API (`httpx.MockTransport`) and a fake publisher; no network |
 | Unit, watcher | Matching, distances, watch copies by revision, polling and price drops, outbox, HTTP endpoints | In-memory SQLite (PostgreSQL in CI), the fake source, a fake publisher |
+| Unit, eBay source | Search parameters and headers, the token request and its reuse and renewal, parsing prices, shipping and locations, clear errors without the keys in them | A fake eBay (`httpx.MockTransport`) and a fake clock |
 | Consumer | Watch events through the exchange into the watcher; unreadable messages rejected | FastStream's in-memory `TestRabbitBroker` |
 | Integration | Publishing through a real RabbitMQ and reading it back | Runs when `RABBITMQ_URL` is set |
 | Retries on a real broker | A temporary failure comes back after its delay and is sent; a message that keeps failing lands in the dead-letter queue, survives a peek, and is sent after a replay | Notifier tests against real RabbitMQ, when `NOTIFIER_TEST_RABBITMQ_URL` is set |
@@ -597,3 +617,9 @@ contracts only: no logic, no database code.
 - **The notifier's retry route is tied to fixed queue names.** Its RabbitMQ integration
   tests use the real queue names, so they can't run while a notifier consumes from the
   same broker.
+- **eBay: only the newest 50 per set.** Each poll reads one page of results. Polling
+  every 15 minutes, that only misses listings when more than 50 appear for one set in
+  between.
+- **eBay: distance depends on the postcode eBay gives.** Distance only works for a full
+  Belgian postcode. Sellers abroad, or a postcode eBay shortens, give an unknown
+  distance, which doesn't rule the listing out.

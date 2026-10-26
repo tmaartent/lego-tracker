@@ -29,5 +29,11 @@ class Source(Protocol):
     """
 
     name: str
+    # How often to poll it; None means the watcher's default. APIs with a daily
+    # call limit set their own.
+    poll_interval_seconds: float | None = None
 
     async def fetch(self, watches: Sequence[WatchState]) -> list[FoundListing]: ...
+
+    async def aclose(self) -> None:
+        """Release connections when the watcher stops."""

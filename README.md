@@ -21,7 +21,8 @@ Telegram when a new one shows up.
 - **Watch for sets**: "6086-1, max €150 including shipping, within 50 km of Genk".
   The watcher service polls its sources, recognizes the set number in listing titles,
   works out the total price and the distance from home, and announces new matches and
-  price drops as events. Its only source so far is a fake marketplace for demos.
+  price drops as events. It searches eBay through the official Browse API, and has a
+  fake marketplace for demos.
 - **Get notified on Telegram** of every new match and price drop. Failed sends are
   retried with increasing delays; messages that keep failing wait in a dead-letter
   queue until they're replayed.
@@ -114,6 +115,14 @@ To get the messages on Telegram: create a bot with [@BotFather](https://t.me/Bot
 put its token in `.env` as `NOTIFIER_TELEGRAM_BOT_TOKEN`, send the bot a message, and
 find your chat id with `docker compose exec notifier python -m notifier.find_chat_id`.
 Put that in `.env` as `NOTIFIER_TELEGRAM_CHAT_ID` and run `docker compose up -d notifier`.
+Group and channel ids start with a minus sign; keep it.
+
+To search eBay: create a free developer account at https://developer.ebay.com, and a
+production keyset. eBay asks how you handle its account deletion notifications; this
+app stores no eBay user data, so you can apply for the exemption. Put the App ID and
+Cert ID in `.env` as `WATCHER_EBAY_CLIENT_ID` and `WATCHER_EBAY_CLIENT_SECRET`, add
+`WATCHER_SOURCES=["fake","ebay"]`, and run `docker compose up -d watcher`. It searches
+every 15 minutes; `curl -X POST localhost:8001/sources/ebay/poll` searches now.
 
 Without Docker (Python 3.12+, SQLite, no events published):
 
@@ -139,10 +148,10 @@ PostgreSQL and RabbitMQ.
       `listing.matched` / `listing.price_dropped` events.
 - [x] **Notifier service** with Telegram, delayed retries and a dead-letter queue.
 - [ ] **Email alerts source**: saved-search alerts from 2dehands and Marktplaats, read over IMAP.
-- [ ] **eBay source** through the official Browse API.
       Sites without a public API only via their own saved-search email alerts, not scraping.
+- [x] **eBay source** through the official Browse API.
 - [ ] **Offers in core**: show matched listings in the admin, next to the watch.
 - [ ] **Deal score** against typical BrickLink prices.
 - [ ] Daily digest of new matches.
-- [ ] **Per-source rate limits** and back-off for real marketplaces.
+- [ ] **Back-off** when a marketplace rate-limits (each source already has its own poll interval).
 - [ ] Minifigures in set inventories.
